@@ -2,6 +2,8 @@
 Step 3: The GPT model.
 Part 1 of 4: config, embeddings, and the output head.
 Part 2 of 4: causal self-attention.
+Part 3 of 4: the MLP, the transformer block, and the full model.
+Part 4 of 4: generating text.
 
 The job of the model: given a sequence of token ids, predict the NEXT token at
 every position. Part 1 builds the input and output ends of the model:
@@ -90,6 +92,45 @@ class CausalSelfAttention(nn.Module):
         return self.proj(y)
 
 
+class MLP(nn.Module):
+    """
+    Part 3: after attention GATHERS information from other positions, the MLP
+    PROCESSES it, separately at each position. Widen to 4x, apply a non-linear
+    function (GELU), shrink back. Most of the model's "knowledge" (facts,
+    word patterns) is thought to be stored in these weights.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+
+    def forward(self, x):
+        return self.proj(F.gelu(self.fc(x)))
+
+
+class Block(nn.Module):
+    """
+    One transformer block = attention + MLP, each wrapped the same way:
+        x = x + layer(norm(x))
+    The "x +" is the residual connection: each layer ADDS a small change to x
+    instead of replacing it. Information (and gradients during training) can
+    flow straight through all 12 blocks, which is what makes deep models trainable.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.mlp = MLP(config)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))   # positions talk to each other
+        x = x + self.mlp(self.ln_2(x))    # each position thinks on its own
+        return x
+
+
 class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -103,7 +144,8 @@ class GPT(nn.Module):
         # model can tell "the cat" from "cat the". Added to the token vector.
         self.wpe = nn.Embedding(config.block_size, config.n_embd)
 
-        # (Part 3 adds the transformer blocks here)
+        # The transformer blocks, stacked n_layer deep.
+        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
 
         # Final normalization, then the output head: turns each n_embd vector
         # back into one score ("logit") per token in the vocabulary.
@@ -116,6 +158,13 @@ class GPT(nn.Module):
         self.lm_head.weight = self.wte.weight
 
         self.apply(self._init_weights)
+
+        # Each block ADDS its output to x, so with 12 blocks x would grow with
+        # depth. Starting the two "proj" layers (the last layer before each
+        # addition) extra small keeps x's size steady at the start of training.
+        for name, p in self.named_parameters():
+            if name.endswith("proj.weight"):
+                nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
 
     def _init_weights(self, module):
         # Start with small random numbers. Too big and training blows up;
@@ -133,7 +182,8 @@ class GPT(nn.Module):
         pos = torch.arange(T, device=idx.device)       # [0, 1, 2, ..., T-1]
         x = self.wte(idx) + self.wpe(pos)              # (B, T, C) + (T, C) -> (B, T, C)
 
-        # (Part 3: x passes through the transformer blocks here)
+        for block in self.blocks:
+            x = block(x)
 
         x = self.ln_f(x)
         logits = self.lm_head(x)                       # (B, T, vocab_size)
@@ -145,6 +195,38 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
 
+    @torch.no_grad()   # no training here, so skip gradient bookkeeping
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        """
+        Part 4: write text, one token at a time.
+        idx: (B, T) token ids to start from (the "prompt").
+        Each loop: run the model, look ONLY at the scores for the last position
+        (that's the prediction for the next token), pick a token, append it,
+        and feed the longer sequence back in.
+        """
+        for _ in range(max_new_tokens):
+            # The model can't see more than block_size tokens, so keep the most recent.
+            idx_cond = idx[:, -self.config.block_size:]
+            logits, _ = self(idx_cond)
+            logits = logits[:, -1, :]                        # (B, vocab_size)
+
+            if temperature == 0:
+                # Greedy: always take the single most likely token.
+                next_id = logits.argmax(dim=-1, keepdim=True)
+            else:
+                # Temperature: < 1 makes likely tokens even more likely (safer,
+                # more repetitive); > 1 flattens the odds (more random).
+                logits = logits / temperature
+                if top_k is not None:
+                    # Only allow the top_k most likely tokens; ban the long tail of junk.
+                    kth_best = torch.topk(logits, min(top_k, logits.size(-1))).values[:, [-1]]
+                    logits[logits < kth_best] = float("-inf")
+                probs = F.softmax(logits, dim=-1)
+                next_id = torch.multinomial(probs, num_samples=1)  # roll a weighted die
+
+            idx = torch.cat([idx, next_id], dim=1)
+        return idx
+
     def num_params(self):
         # .parameters() lists the shared (tied) matrix only once
         return sum(p.numel() for p in self.parameters())
@@ -152,14 +234,13 @@ class GPT(nn.Module):
 
 if __name__ == "__main__":
     # Test: python -m minillm.model   (from the mini-llm/ root)
+    import time
+
     import numpy as np
 
-    torch.manual_seed(0)
-    np.random.seed(0)
-
-    config = GPTConfig(n_embd=128, block_size=64)   # tiny version for a CPU test
-    model = GPT(config)
-    print(f"parameters: {model.num_params():,}")
+    real = GPT(GPTConfig())
+    print(f"real model (12 layers, 640 wide): {real.num_params():,} parameters")
+    del real
 
     data = np.fromfile("data/fineweb/train_0001.bin", dtype=np.uint16)
 
@@ -171,20 +252,30 @@ if __name__ == "__main__":
         y = np.stack([data[s + 1:s + T + 1] for s in starts]).astype(np.int64)
         return torch.from_numpy(x), torch.from_numpy(y)
 
-    x, y = get_batch()
-    logits, loss = model(x, y)
-    print(f"input shape:  {tuple(x.shape)}")
-    print(f"logits shape: {tuple(logits.shape)}")
-    print(f"loss at start: {loss.item():.3f}   "
-          f"(pure guessing = ln({config.vocab_size}) = {math.log(config.vocab_size):.3f})")
+    def train_tiny(n_layer, steps=300):
+        # Same seed and same batches for both runs, so it's a fair comparison.
+        torch.manual_seed(0)
+        np.random.seed(0)
+        config = GPTConfig(n_layer=n_layer, n_head=4, n_embd=128, block_size=64)
+        model = GPT(config)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3)
+        print(f"\n--- {n_layer} blocks, {model.num_params():,} parameters ---")
+        recent = []
+        t0 = time.time()
+        for step in range(steps + 1):
+            x, y = get_batch()
+            _, loss = model(x, y)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            recent = (recent + [loss.item()])[-50:]
+            if step % 100 == 0:
+                print(f"step {step:3d}: loss {loss.item():.3f}")
+        avg = sum(recent) / len(recent)
+        print(f"average loss over last 50 steps: {avg:.3f}  ({time.time() - t0:.0f}s)")
+        return avg
 
-    # A few hundred training steps, just to prove the pieces learn something.
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3)
-    for step in range(301):
-        x, y = get_batch()
-        _, loss = model(x, y)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        if step % 50 == 0:
-            print(f"step {step:3d}: loss {loss.item():.3f}")
+    # 0 blocks = Part 1's bigram model. 2 blocks = a real (tiny) transformer.
+    bigram = train_tiny(n_layer=0)
+    transformer = train_tiny(n_layer=2)
+    print(f"\ntransformer beats bigram by {bigram - transformer:.3f}")
