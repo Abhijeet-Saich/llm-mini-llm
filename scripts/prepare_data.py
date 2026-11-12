@@ -27,6 +27,7 @@ from tqdm import tqdm
 
 from minillm.fineweb import iter_documents
 from minillm.tokenizer import Tokenizer
+import sys 
 
 # Each worker process loads its own copy of the tokenizer once, here.
 tokenizer = None
@@ -111,3 +112,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # The streaming download leaves background threads running. All our files
+    # are already written, so exit right away instead of letting Python's
+    # normal shutdown trip over those threads.
+    sys.stdout.flush()
+    os._exit(0)

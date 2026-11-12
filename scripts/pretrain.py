@@ -7,7 +7,7 @@ Local test on your Mac (tiny model, CPU, a few minutes):
 Continue a run that stopped (crash, Ctrl+C, Modal timeout):
     python -m scripts.pretrain --preset tiny --resume
 
-The real run on Modal uses --preset full (Step 5).
+On Modal (Step 5): --preset rehearsal (70M, cheap test run), then --preset large (320M).
 Any setting can be overridden, e.g.  --max-steps 1000 --lr 1e-3
 """
 
@@ -24,7 +24,7 @@ from minillm.dataloader import ShardLoader
 from minillm.model import GPT, GPTConfig
 from minillm.tokenizer import Tokenizer
 
-# Two sets of defaults. "tiny" runs on a laptop CPU; "full" is the real model.
+# Sets of defaults. "tiny" runs on a laptop CPU; "rehearsal" and "large" run on a GPU.
 PRESETS = {
     "tiny": dict(
         n_layer=2, n_head=4, n_embd=128, block_size=64,
@@ -32,11 +32,20 @@ PRESETS = {
         max_steps=500, warmup_steps=50, lr=3e-3,
         eval_every=100, eval_batches=20, sample_every=250, save_every=250, log_every=25,
     ),
-    "full": dict(
+    # Rehearsal: the 70M model on ~1B tokens (~$4). Tests the whole pipeline cheaply.
+    "rehearsal": dict(
         n_layer=12, n_head=10, n_embd=640, block_size=1024,
         batch_size=32, grad_accum=16,          # 32 x 1024 x 16 = 524,288 tokens per step
-        max_steps=4000, warmup_steps=200, lr=6e-4,   # we'll finalize these in Step 5
-        eval_every=250, eval_batches=50, sample_every=500, save_every=250, log_every=10,
+        max_steps=1900, warmup_steps=100, lr=6e-4,
+        eval_every=200, eval_batches=40, sample_every=500, save_every=250, log_every=10,
+    ),
+    # Large: the real model. ~320M parameters on ~6.5B tokens.
+    "large": dict(
+        n_layer=24, n_head=16, n_embd=1024, block_size=1024,
+        batch_size=32, grad_accum=16,          # 524,288 tokens per step
+        max_steps=12400, warmup_steps=400,     # 12,400 x 524,288 = 6.5B tokens
+        lr=3e-4,                               # bigger models need gentler steps
+        eval_every=500, eval_batches=40, sample_every=1000, save_every=500, log_every=10,
     ),
 }
 
@@ -209,8 +218,11 @@ def main():
         last = done == args.max_steps
         if done % args.log_every == 0 or last or step == start_step:
             train_loss = loss_sum.item()
+            mem = (f" | GPU mem {torch.cuda.max_memory_allocated() / 1e9:.1f} GB"
+                   if device == "cuda" else "")
             print(f"step {done:5d}/{args.max_steps} | loss {train_loss:.3f} | lr {lr:.2e} | "
-                  f"grad norm {grad_norm:.2f} | {dt * 1000:.0f} ms | {tokens_per_step / dt:,.0f} tok/s")
+                  f"grad norm {grad_norm:.2f} | {dt * 1000:.0f} ms | {tokens_per_step / dt:,.0f} tok/s{mem}",
+                  flush=True)
             log(done, "train", train_loss)
 
         if done % args.eval_every == 0 or last:
