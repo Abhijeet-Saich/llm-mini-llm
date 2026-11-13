@@ -196,7 +196,7 @@ class GPT(nn.Module):
         return logits, loss
 
     @torch.no_grad()   # no training here, so skip gradient bookkeeping
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, stop_token=None):
         """
         Part 4: write text, one token at a time.
         idx: (B, T) token ids to start from (the "prompt").
@@ -225,6 +225,9 @@ class GPT(nn.Module):
                 next_id = torch.multinomial(probs, num_samples=1)  # roll a weighted die
 
             idx = torch.cat([idx, next_id], dim=1)
+            # Step 6: stop early once the model writes the stop token (e.g. <|assistant_end|>).
+            if stop_token is not None and (next_id == stop_token).all():
+                break
         return idx
 
     def num_params(self):
